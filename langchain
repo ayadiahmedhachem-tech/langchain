@@ -1,0 +1,184 @@
+import re
+from flask import Flask, request, jsonify, render_template
+from flask_cors import CORS
+
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnableLambda
+from langchain_ollama import ChatOllama
+
+app = Flask(__name__)
+CORS(app)
+
+decompose_prompt = PromptTemplate.from_template(
+    "Split the question into up to 3 concise sub-questions. "
+    "Return them as a numbered list (1., 2., 3.), nothing else.\n\n"
+    "Question:\n{question}"
+)
+
+decomposer = decompose_prompt | ChatOllama(
+    model="qwen3.5:4b",
+    temperature=0.0
+)
+
+def parse_numbered_subquestions(base_msg):
+    text = getattr(base_msg, "content", str(base_msg)).strip()
+
+    print("This is the response of the decomposer ", text)
+
+    lines = re.split(r"\r?\n", text)
+    subqs = []
+
+    for line in lines:
+        match = re.match(
+            r"\s*\d+[.)]\s*(.+\S)\s*$",
+            line
+        )
+
+        if match:
+            subqs.append(match.group(1).strip())
+
+    if not subqs and text:
+        subqs = [text]
+
+    return subqs[:3]
+
+parse_subq_runnable = RunnableLambda(
+    parse_numbered_subquestions
+)
+
+answer_prompt = PromptTemplate.from_template(
+    "You are a concise assistant. For the sub-question below, produce:\n"
+    "Answer: <one-line answer>\n"
+    "Steps:\n"
+    "- <step1>\n"
+    "- <step2>\n"
+    "Keep it short.\n\n"
+    "Sub-question: {subq}"
+)
+
+answer_chain = answer_prompt | ChatOllama(
+    model="qwen3.5:4b",
+    temperature=0.2
+)
+
+def run_answers(subquestions):
+    inputs = [
+        {"subq": question}
+        for question in subquestions
+    ]
+
+    outputs = answer_chain.batch(inputs)
+    parsed = []
+
+    for output in outputs:
+        text = getattr(output, "content", str(output)).strip()
+        answer_line = None
+        steps = []
+
+        for line in text.splitlines():
+            if line.lower().startswith("answer:"):
+                answer_line = line.split(":", 1)[1].strip()
+            elif re.match(r"\s*[-•]\s+", line):
+                step = re.sub(
+                    r"^\s*[-•]\s+",
+                    "",
+                    line
+                ).strip()
+                steps.append(step)
+
+        parsed.append(
+            {
+                "answer": answer_line or text,
+                "steps": steps or ["(no steps parsed)"],
+                "raw": text
+            }
+        )
+    return parsed
+
+run_answers_runnable = RunnableLambda(
+    run_answers
+)
+
+def format_subanswers_block(ans_list):
+    blocks = []
+
+    for i, answer in enumerate(ans_list, start=1):
+        blocks.append(
+            f"{i}. Answer: {answer['answer']}"
+        )
+        blocks.append("   Steps:")
+        for step in answer["steps"]:
+            blocks.append(
+                f"   - {step}"
+            )
+
+    return "\n".join(blocks)
+
+format_runnable = RunnableLambda(
+    lambda answers: {
+        "subanswers_text": format_subanswers_block(answers)
+    }
+)
+
+combine_prompt = PromptTemplate.from_template(
+    "Synthesize a single concise final answer from these "
+    "numbered sub-answer blocks.\n\n"
+    "Input (each item is like 'Answer: ...' and 'Steps: - ...'):\n"
+    "{subanswers_text}\n\n"
+    "Return exactly three lines:\n"
+    "1) Final Answer: <one line>\n"
+    "2) Key points: - <p1>; - <p2>\n"
+    "3) Confidence: <low/medium/high>"
+)
+
+combiner = (
+    format_runnable
+    | combine_prompt
+    | ChatOllama(
+        model="qwen3.5:4b",
+        temperature=0.0
+    )
+)
+
+pipeline = (
+    decomposer
+    | parse_subq_runnable
+    | run_answers_runnable
+    | combiner
+)
+
+@app.route('/')
+def home():
+    return render_template('index.html')
+
+@app.route('/api/process', methods=['POST'])
+def process_question():
+    try:
+        data = request.get_json()
+        question = data.get('question', '').strip()
+        
+        if not question:
+            return jsonify({'error': 'Question is required'}), 400
+        
+        decompose_output = decomposer.invoke({"question": question})
+        subquestions = parse_numbered_subquestions(decompose_output)
+        
+        answers = run_answers(subquestions)
+        
+        final_output = combiner.invoke(answers)
+        final_text = getattr(final_output, "content", str(final_output)).strip()
+        
+        return jsonify({
+            'question': question,
+            'subquestions': subquestions,
+            'answers': answers,
+            'final_answer': final_text
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == "__main__":
+    print("Starting AI Question Decomposer web server...")
+    print("Open your browser to http://localhost:5000")
+    app.run(debug=True, host='0.0.0.0', port=5000)
